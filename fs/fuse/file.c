@@ -1716,6 +1716,11 @@ struct fuse_fill_wb_data {
 	struct fuse_file *ff;
 	struct inode *inode;
 	struct page **orig_pages;
+	
+	// pos variable to keep track of
+	// offsets
+	
+	int pos;
 };
 
 static void fuse_writepages_send(struct fuse_fill_wb_data *data)
@@ -1827,8 +1832,19 @@ static int fuse_writepages_fill(struct page *page,
 	    (is_writeback || req->num_pages == fc->max_pages ||
 	     (req->num_pages + 1) * PAGE_SIZE > fc->max_write ||
 	     data->orig_pages[req->num_pages - 1]->index + 1 != page->index)) {
-		fuse_writepages_send(data);
-		data->req = NULL;
+		//fuse_writepages_send(data);
+		//data->req = NULL;
+		
+		// Accumulates random write requests
+		if (req->num_pages == fc->max_pages) {
+			fuse_writepages_send(data);
+			data->req = NULL;
+
+			// After 32 pages are sent to user,
+			// pos variable is reset to 0
+
+			data->pos = 0;
+		}
 	} else if (req && req->num_pages == req->max_pages) {
 		if (!fuse_req_realloc_pages(fc, req, GFP_NOFS)) {
 			fuse_writepages_send(data);
@@ -1858,7 +1874,8 @@ static int fuse_writepages_fill(struct page *page,
 		struct fuse_inode *fi = get_fuse_inode(inode);
 
 		err = -ENOMEM;
-		req = fuse_request_alloc_nofs(FUSE_REQ_INLINE_PAGES);
+		//req = fuse_request_alloc_nofs(FUSE_REQ_INLINE_PAGES);
+		req = fuse_request_alloc_nofs(FUSE_DEFAULT_MAX_PAGES_PER_REQ);
 		if (!req) {
 			__free_page(tmp_page);
 			goto out_unlock;
@@ -1879,6 +1896,21 @@ static int fuse_writepages_fill(struct page *page,
 
 		data->req = req;
 	}
+
+	req->misc.write.in.rand[data->pos] = page_offset(page);
+	
+	
+	//printk("Offset %d\n", req->misc.write.in.rand[data->pos]);
+
+	if (data->pos > 0) {
+		if (req->misc.write.in.rand[data->pos] - (req->misc.write.in.rand[data->pos-1] + 4096) >= 4096) {
+				//printk("Request type in FUSE_OPT_RAND_WRITE \n");
+				req->in.h.opcode = FUSE_OPT_RAND_WRITE;
+		}
+	}
+
+	data->pos = data->pos + 1;
+
 	set_page_writeback(page);
 
 	copy_highpage(tmp_page, page);
@@ -1927,6 +1959,8 @@ static int fuse_writepages(struct address_space *mapping,
 	data.req = NULL;
 	data.ff = NULL;
 
+	// setting pos variable val to 0
+	data.pos = 0;
 	err = -ENOMEM;
 	data.orig_pages = kcalloc(fc->max_pages,
 				  sizeof(struct page *),
