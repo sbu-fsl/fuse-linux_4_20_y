@@ -723,6 +723,7 @@ struct fuse_out_header {
 	uint32_t	len;
 	int32_t		error;
 	uint64_t	unique;
+	uint64_t 	bw_count;
 };
 
 struct fuse_dirent {

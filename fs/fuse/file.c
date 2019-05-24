@@ -20,6 +20,7 @@
 #include <linux/uio.h>
 
 static const struct file_operations fuse_direct_io_file_operations;
+static unsigned int gEndcount = 0;
 
 static int fuse_send_open(struct fuse_conn *fc, u64 nodeid, struct file *file,
 			  int opcode, struct fuse_open_out *outargp)
@@ -1581,6 +1582,8 @@ static void fuse_writepage_end(struct fuse_conn *fc, struct fuse_req *req)
 		 */
 		fuse_send_writepage(fc, next, inarg->offset + inarg->size);
 	}
+	gEndcount++;
+	//printk("gEndcount = %u:: fuse_writepage_end called for req = %llu\n", gEndcount, req->in.h.unique);
 	fi->writectr--;
 	fuse_writepage_finish(fc, req);
 	spin_unlock(&fc->lock);

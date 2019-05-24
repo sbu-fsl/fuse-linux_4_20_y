@@ -31,6 +31,8 @@ MODULE_ALIAS("devname:fuse");
 
 static struct kmem_cache *fuse_req_cachep;
 
+static unsigned int gCount = 0;
+
 static struct fuse_dev *fuse_get_dev(struct file *file)
 {
 	/*
@@ -329,6 +331,7 @@ void fuse_put_request(struct fuse_conn *fc, struct fuse_req *req)
 			 * We get here in the unlikely case that a background
 			 * request was allocated but not sent
 			 */
+			printk("Bad State\n");
 			spin_lock(&fc->bg_lock);
 			if (!fc->blocked)
 				wake_up(&fc->blocked_waitq);
@@ -353,9 +356,10 @@ static unsigned len_args(unsigned numargs, struct fuse_arg *args)
 	unsigned nbytes = 0;
 	unsigned i;
 
-	for (i = 0; i < numargs; i++)
+	for (i = 0; i < numargs; i++){
+		//printk("arg num %d size = %d\n", i, args[i].size);
 		nbytes += args[i].size;
-
+	}
 	return nbytes;
 }
 
@@ -402,7 +406,6 @@ void fuse_queue_forget(struct fuse_conn *fc, struct fuse_forget_link *forget,
 static void flush_bg_queue(struct fuse_conn *fc)
 {
 	struct fuse_iqueue *fiq = &fc->iq;
-
 	while (fc->active_background < fc->max_background &&
 	       !list_empty(&fc->bg_queue)) {
 		struct fuse_req *req;
@@ -442,6 +445,7 @@ static void request_end(struct fuse_conn *fc, struct fuse_req *req)
 		clear_bit(FR_BACKGROUND, &req->flags);
 		if (fc->num_background == fc->max_background) {
 			fc->blocked = 0;
+			//printk("fc unblocked\n");
 			wake_up(&fc->blocked_waitq);
 		} else if (!fc->blocked) {
 			/*
@@ -464,8 +468,11 @@ static void request_end(struct fuse_conn *fc, struct fuse_req *req)
 		spin_unlock(&fc->bg_lock);
 	}
 	wake_up(&req->waitq);
-	if (req->end)
+	if (req->end){
+		//printk("Calling request end function for req id = %llu", req->in.h.unique);
+		gCount++;
 		req->end(fc, req);
+	}
 put_request:
 	fuse_put_request(fc, req);
 }
@@ -632,7 +639,7 @@ ssize_t fuse_simple_request(struct fuse_conn *fc, struct fuse_args *args)
 bool fuse_request_queue_background(struct fuse_conn *fc, struct fuse_req *req)
 {
 	bool queued = false;
-
+	//printk("Req type = %d in %s\n",req->in.h.opcode, __FUNCTION__);
 	WARN_ON(!test_bit(FR_BACKGROUND, &req->flags));
 	if (!test_bit(FR_WAITING, &req->flags)) {
 		__set_bit(FR_WAITING, &req->flags);
@@ -642,8 +649,10 @@ bool fuse_request_queue_background(struct fuse_conn *fc, struct fuse_req *req)
 	spin_lock(&fc->bg_lock);
 	if (likely(fc->connected)) {
 		fc->num_background++;
-		if (fc->num_background == fc->max_background)
+		if (fc->num_background == fc->max_background){
 			fc->blocked = 1;
+			//printk("fc is blocked\n");
+		}
 		if (fc->num_background == fc->congestion_threshold && fc->sb) {
 			set_bdi_congested(fc->sb->s_bdi, BLK_RW_SYNC);
 			set_bdi_congested(fc->sb->s_bdi, BLK_RW_ASYNC);
@@ -1272,6 +1281,283 @@ __releases(fiq->waitq.lock)
 		return fuse_read_batch_forget(fiq, cs, nbytes);
 }
 
+static ssize_t copy_write_reqs_to_buffer (struct fuse_dev *fud, struct file *file,
+                                struct fuse_copy_state *cs, size_t nbytes, int *retry)
+{
+	ssize_t err;
+	struct fuse_conn *fc = fud->fc;
+	struct fuse_iqueue *fiq = &fc->iq;
+	struct fuse_pqueue *fpq = &fud->pq;
+	struct fuse_req *write_req;
+	struct fuse_in *write_in;
+	unsigned write_reqsize = 0;
+	int write_req_counter = 0;
+	struct fuse_req *tmp_req;
+	int count = 0;
+	unsigned int hash;
+	struct list_head temp_queue;
+
+	INIT_LIST_HEAD(&temp_queue);	
+
+	list_for_each_entry_safe(write_req, tmp_req, &fiq->pending, list) {
+		BUG_ON(count > 32);
+		// Should always be true as it was checked before
+		if(write_req->in.h.opcode == 16) {
+			write_req_counter = write_req_counter + 1;
+			write_in = &write_req->in;
+			write_reqsize += write_in->h.len;
+
+			if(write_reqsize < nbytes) {
+				list_del_init(&write_req->list);
+				list_add_tail(&write_req->list, &temp_queue);
+				//printk("Added req no.%d to temp queue\n", count);
+				count = count + 1;
+			}
+			else {
+				if(count == 0){
+					//printk("First request is too large\n");
+					write_reqsize -= write_in->h.len;
+					clear_bit(FR_PENDING, &write_req->flags);
+					list_del_init(&write_req->list);	
+					write_req->out.h.error = -EIO;
+					request_end(fc, write_req);
+					//Unlock the spinlock before retrying
+					spin_unlock(&fiq->waitq.lock);
+					*retry = true;
+					goto exit;
+				}
+				break;
+			}
+		}
+		else 
+			break;
+	}
+	//printk("Total Requests batched = %d\n", count);
+
+	// Release the spinlock on pending queue  once the requests are 
+	// copied into the the temp queue.
+	spin_unlock(&fiq->waitq.lock);
+	
+	//Iterate over temp queue and process the requests.	
+	write_reqsize = 0;
+	list_for_each_entry_safe(write_req, tmp_req, &temp_queue, list) {
+		write_in = &write_req->in;
+		write_reqsize += write_in->h.len;
+		clear_bit(FR_PENDING, &write_req->flags);
+		list_del_init(&write_req->list);
+
+		spin_lock(&fpq->lock);
+		list_add(&write_req->list, &fpq->io);
+		spin_unlock(&fpq->lock);
+
+		cs->req = write_req;
+		err = fuse_copy_one(cs, &write_in->h, sizeof(write_in->h));
+
+		//printk("Performing write operation \n");
+
+		if (!err)
+			err = fuse_copy_args(cs, write_in->numargs, write_in->argpages,(struct fuse_arg *) write_in->args, 0);
+
+		spin_lock(&fpq->lock);
+		clear_bit(FR_LOCKED, &write_req->flags);
+
+		if (!fpq->connected) {
+			err = (fc->aborted && fc->abort_err) ? -ECONNABORTED : -ENODEV;
+			goto out_end;
+		}
+
+		if (err) {
+			write_req->out.h.error = -EIO;
+			goto out_end;
+		}
+
+		if (!test_bit(FR_ISREPLY, &write_req->flags)) {
+			err = write_reqsize;
+			goto out_end;
+		}
+
+		hash = fuse_req_hash(write_req->in.h.unique);
+		list_move_tail(&write_req->list, &fpq->processing[hash]);
+		__fuse_get_request(write_req);
+		set_bit(FR_SENT, &write_req->flags);
+		spin_unlock(&fpq->lock);
+
+		/* matches barrier in request_wait_answer() */
+		smp_mb__after_atomic();
+		if (test_bit(FR_INTERRUPTED, &write_req->flags))
+			queue_interrupt(fiq, write_req);
+		fuse_put_request(fc, write_req);
+
+	}
+
+	fuse_copy_finish(cs);
+	return write_reqsize;
+
+out_end:
+	if (!test_bit(FR_PRIVATE, &write_req->flags))
+			list_del_init(&write_req->list);
+	spin_unlock(&fpq->lock);
+	fuse_copy_finish(cs);
+	request_end(fc, write_req);
+exit:
+	return err;
+
+}
+
+static ssize_t copy_one_req_to_buffer(struct fuse_dev *fud, struct file *file,
+				struct fuse_copy_state *cs, size_t nbytes, int* retry)
+{
+	ssize_t err;
+	struct fuse_conn *fc = fud->fc;
+	struct fuse_iqueue *fiq = &fc->iq;
+	struct fuse_pqueue *fpq = &fud->pq;
+	struct fuse_in *in;
+	struct fuse_req *req;
+	unsigned reqsize;
+	unsigned int hash;
+
+	req = list_entry(fiq->pending.next, struct fuse_req, list);
+	clear_bit(FR_PENDING, &req->flags);
+	list_del_init(&req->list);
+	spin_unlock(&fiq->waitq.lock);
+
+	in = &req->in;
+	reqsize = in->h.len;
+
+	/* If request is too large, reply with an error and restart the read */
+	if (nbytes < reqsize) {
+
+		req->out.h.error = -EIO;
+		/* SETXATTR is special, since it may contain too large data */
+		if (in->h.opcode == FUSE_SETXATTR)
+			req->out.h.error = -E2BIG;
+		printk(KERN_INFO "Request too large.. \n");
+		request_end(fc, req);
+		*retry = 1;
+		goto exit;
+	}
+
+	spin_lock(&fpq->lock);
+	list_add(&req->list, &fpq->io);
+	spin_unlock(&fpq->lock);
+
+	cs->req = req;
+	err = fuse_copy_one(cs, &in->h, sizeof(in->h));
+
+	//printk("Inside copy_one_req_to_buffer method \n");
+	if (!err)
+		err = fuse_copy_args(cs, in->numargs, in->argpages,
+				(struct fuse_arg *) in->args, 0);
+
+	fuse_copy_finish(cs);
+
+	spin_lock(&fpq->lock);
+	clear_bit(FR_LOCKED, &req->flags);
+	
+	if (!fpq->connected) {
+		err = (fc->aborted && fc->abort_err) ? -ECONNABORTED : -ENODEV;
+		goto out_end;
+	}
+	
+	if (err) {
+		req->out.h.error = -EIO;
+		goto out_end;
+	}
+
+	if (!test_bit(FR_ISREPLY, &req->flags)) {
+		err = reqsize;
+		goto out_end;
+	}
+
+	hash = fuse_req_hash(req->in.h.unique);
+	list_move_tail(&req->list, &fpq->processing[hash]);
+	__fuse_get_request(req);
+	set_bit(FR_SENT, &req->flags);
+	spin_unlock(&fpq->lock);
+
+	/* matches barrier in request_wait_answer() */
+	smp_mb__after_atomic();
+	if (test_bit(FR_INTERRUPTED, &req->flags))
+		queue_interrupt(fiq, req);
+	fuse_put_request(fc, req);
+	return reqsize;
+
+out_end:
+	if (!test_bit(FR_PRIVATE, &req->flags))
+		list_del_init(&req->list);
+
+	spin_unlock(&fpq->lock);
+	request_end(fc, req);
+	return err;
+exit:
+	return reqsize;
+}
+
+
+static ssize_t fuse_dev_do_read(struct fuse_dev *fud, struct file *file,
+				struct fuse_copy_state *cs, size_t nbytes)
+{
+	ssize_t err;
+	struct fuse_conn *fc = fud->fc;
+	struct fuse_iqueue *fiq = &fc->iq;
+	struct fuse_req *req;
+	unsigned reqsize;
+	unsigned int retry;
+
+restart:
+	spin_lock(&fiq->waitq.lock);
+	retry = 0;
+	err = -EAGAIN;
+	if ((file->f_flags & O_NONBLOCK) && fiq->connected &&
+			!request_pending(fiq))
+		goto err_unlock;
+
+	err = wait_event_interruptible_exclusive_locked(fiq->waitq,
+			!fiq->connected || request_pending(fiq));
+	if (err)
+		goto err_unlock;
+
+	if (!fiq->connected) {
+		err = (fc->aborted && fc->abort_err) ? -ECONNABORTED : -ENODEV;
+		goto err_unlock;
+	}
+
+	if (!list_empty(&fiq->interrupts)) {
+		req = list_entry(fiq->interrupts.next, struct fuse_req,
+				intr_entry);
+		return fuse_read_interrupt(fiq, cs, nbytes, req);
+	}
+
+	if (forget_pending(fiq)) {
+		if (list_empty(&fiq->pending) || fiq->forget_batch-- > 0)
+			return fuse_read_forget(fc, fiq, cs, nbytes);
+
+		if (fiq->forget_batch <= -8)
+			fiq->forget_batch = 16;
+	}
+
+
+	req = list_entry(fiq->pending.next, struct fuse_req, list);
+	//printk(KERN_INFO "About to pick-up request num %d from queue\n", req->in.h.opcode);
+	
+	if(req->in.h.opcode == 16) {
+		reqsize = copy_write_reqs_to_buffer(fud, file, cs, nbytes, &retry);
+	}
+	else {
+		reqsize = copy_one_req_to_buffer(fud, file, cs, nbytes, &retry);
+	}
+
+	if(retry == 1)
+		goto restart;
+
+	return reqsize;
+
+err_unlock:
+	spin_unlock(&fiq->waitq.lock);
+	return err;
+}
+
+#if 0
 /*
  * Read a single request into the userspace filesystem's buffer.  This
  * function waits until a request is available, then removes it from
@@ -1281,7 +1567,7 @@ __releases(fiq->waitq.lock)
  * request_end().  Otherwise add it to the processing list, and set
  * the 'sent' flag.
  */
-static ssize_t fuse_dev_do_read(struct fuse_dev *fud, struct file *file,
+static ssize_t fuse_dev_do_read_temp(struct fuse_dev *fud, struct file *file,
 				struct fuse_copy_state *cs, size_t nbytes)
 {
 	ssize_t err;
@@ -1323,7 +1609,8 @@ static ssize_t fuse_dev_do_read(struct fuse_dev *fud, struct file *file,
 		if (fiq->forget_batch <= -8)
 			fiq->forget_batch = 16;
 	}
-
+	
+	printk(KERN_INFO "About to pick-up request from queue\n");
 	req = list_entry(fiq->pending.next, struct fuse_req, list);
 	clear_bit(FR_PENDING, &req->flags);
 	list_del_init(&req->list);
@@ -1331,7 +1618,8 @@ static ssize_t fuse_dev_do_read(struct fuse_dev *fud, struct file *file,
 
 	in = &req->in;
 	reqsize = in->h.len;
-
+	
+	printk(KERN_DEBUG "Request Opcode = %d Size= %d\n", in->h.opcode, reqsize);
 	/* If request is too large, reply with an error and restart the read */
 	if (nbytes < reqsize) {
 		req->out.h.error = -EIO;
@@ -1388,6 +1676,7 @@ out_end:
 	spin_unlock(&fiq->waitq.lock);
 	return err;
 }
+#endif
 
 static int fuse_dev_open(struct inode *inode, struct file *file)
 {
@@ -1870,6 +2159,7 @@ static int copy_out_args(struct fuse_copy_state *cs, struct fuse_out *out,
 		return nbytes != reqsize ? -EINVAL : 0;
 
 	reqsize += len_args(out->numargs, out->args);
+	//printk("Copy-out arg size = %ld\n", reqsize - sizeof(struct fuse_out_header));
 
 	if (reqsize < nbytes || (reqsize > nbytes && !out->argvar))
 		return -EINVAL;
@@ -1883,6 +2173,220 @@ static int copy_out_args(struct fuse_copy_state *cs, struct fuse_out *out,
 	return fuse_copy_args(cs, out->numargs, out->argpages, out->args,
 			      out->page_zeroing);
 }
+static ssize_t fuse_handle_batched_req(struct fuse_dev *fud,
+				 struct fuse_copy_state *cs, size_t nbytes, struct fuse_out_header oh)
+{
+	int err;
+	struct fuse_conn *fc = fud->fc;
+	struct fuse_pqueue *fpq = &fud->pq;
+	struct fuse_req *req;
+	uint64_t  req_id;
+	//struct fuse_write_out w_out;
+	//struct fuse_arg arg;
+	uint64_t end_reqid = oh.unique;
+	uint64_t start_reqid = (oh.unique - (oh.bw_count-1)*FUSE_REQ_ID_STEP);
+	
+	//arg.value = &w_out;
+	//arg.size = sizeof(struct fuse_write_out);
+	
+	for (req_id = start_reqid ; req_id <= end_reqid; req_id += FUSE_REQ_ID_STEP)
+	{
+		oh.unique = req_id;
+
+		spin_lock(&fpq->lock);
+		err = -ENOENT;
+		if (!fpq->connected)
+			goto err_unlock_pq;
+
+		req = request_find(fpq, req_id & ~FUSE_INT_REQ_BIT);
+		if (!req)
+			goto err_unlock_pq;
+
+		/* Is it an interrupt reply ID? */
+		if (oh.unique & FUSE_INT_REQ_BIT) {
+			__fuse_get_request(req);
+			spin_unlock(&fpq->lock);
+
+			err = -EINVAL;
+			if (nbytes != sizeof(struct fuse_out_header)) {
+				fuse_put_request(fc, req);
+				goto err_finish;
+			}
+
+			if (oh.error == -ENOSYS)
+				fc->no_interrupt = 1;
+			else if (oh.error == -EAGAIN)
+				queue_interrupt(&fc->iq, req);
+			fuse_put_request(fc, req);
+
+			fuse_copy_finish(cs);
+			return nbytes;
+		}
+
+		clear_bit(FR_SENT, &req->flags);
+		list_move(&req->list, &fpq->io);
+		req->out.h = oh;
+		set_bit(FR_LOCKED, &req->flags);
+		spin_unlock(&fpq->lock);
+		cs->req = req;
+		if (!req->out.page_replace)
+			cs->move_pages = 0;
+
+		if(req_id == end_reqid){
+			//err = fuse_copy_one(cs, arg.value, arg.size);	
+			err = copy_out_args(cs, &req->out, nbytes);
+			fuse_copy_finish(cs);
+			//printk("Num Args of last requests = %d\n", req->out.numargs);
+			//printk("Total size of batched requests in reply = %d\n", ((struct fuse_write_out *)(req->out.args[0].value))->size);
+		}
+
+		//err = copy_out_args(cs, &req->out, nbytes);
+		//fuse_copy_finish(cs);
+
+		spin_lock(&fpq->lock);
+		clear_bit(FR_LOCKED, &req->flags);
+		if (!fpq->connected)
+			err = -ENOENT;
+		else if (err)
+			req->out.h.error = -EIO;
+		if (!test_bit(FR_PRIVATE, &req->flags))
+			list_del_init(&req->list);
+		spin_unlock(&fpq->lock);
+		//printk("Ending request with unique id: %lld\n", req->in.h.unique);
+		request_end(fc, req);
+	}
+
+	//printk("Total size of batched requests in reply = %d\n", w_out.size);
+	return err ? err : nbytes;
+
+ err_unlock_pq:
+	spin_unlock(&fpq->lock);
+ err_finish:
+	fuse_copy_finish(cs);
+	return err;
+}
+
+static ssize_t fuse_handle_non_batched_req(struct fuse_dev *fud,
+				 struct fuse_copy_state *cs, size_t nbytes, struct fuse_out_header oh)
+{
+	int err;
+	struct fuse_conn *fc = fud->fc;
+	struct fuse_pqueue *fpq = &fud->pq;
+	struct fuse_req *req;
+	//printk("Inside %s\n", __FUNCTION__);
+
+	spin_lock(&fpq->lock);
+	err = -ENOENT;
+	if (!fpq->connected)
+		goto err_unlock_pq;
+
+	req = request_find(fpq, oh.unique & ~FUSE_INT_REQ_BIT);
+	if (!req)
+		goto err_unlock_pq;
+
+	/* Is it an interrupt reply ID? */
+	if (oh.unique & FUSE_INT_REQ_BIT) {
+		__fuse_get_request(req);
+		spin_unlock(&fpq->lock);
+
+		err = -EINVAL;
+		if (nbytes != sizeof(struct fuse_out_header)) {
+			fuse_put_request(fc, req);
+			goto err_finish;
+		}
+
+		if (oh.error == -ENOSYS)
+			fc->no_interrupt = 1;
+		else if (oh.error == -EAGAIN)
+			queue_interrupt(&fc->iq, req);
+		fuse_put_request(fc, req);
+
+		fuse_copy_finish(cs);
+		return nbytes;
+	}
+
+	clear_bit(FR_SENT, &req->flags);
+	list_move(&req->list, &fpq->io);
+	req->out.h = oh;
+	set_bit(FR_LOCKED, &req->flags);
+	spin_unlock(&fpq->lock);
+	cs->req = req;
+	if (!req->out.page_replace)
+		cs->move_pages = 0;
+
+	err = copy_out_args(cs, &req->out, nbytes);
+	fuse_copy_finish(cs);
+
+	spin_lock(&fpq->lock);
+	clear_bit(FR_LOCKED, &req->flags);
+	if (!fpq->connected)
+		err = -ENOENT;
+	else if (err)
+		req->out.h.error = -EIO;
+	if (!test_bit(FR_PRIVATE, &req->flags))
+		list_del_init(&req->list);
+	spin_unlock(&fpq->lock);
+	//printk("Ending request with unique id: %lld\n", req->in.h.unique);
+	request_end(fc, req);
+
+	return err ? err : nbytes;
+
+ err_unlock_pq:
+	spin_unlock(&fpq->lock);
+ err_finish:
+	fuse_copy_finish(cs);
+	return err;
+}
+
+static ssize_t fuse_dev_do_modified_write(struct fuse_dev *fud,
+				 struct fuse_copy_state *cs, size_t nbytes)
+{
+	int err;
+	struct fuse_conn *fc = fud->fc;
+	struct fuse_out_header oh;
+	
+	//printk("Inside %s\n", __FUNCTION__);
+
+	if (nbytes < sizeof(struct fuse_out_header))
+		return -EINVAL;
+
+	err = fuse_copy_one(cs, &oh, sizeof(oh));
+	if (err)
+		goto err_finish;
+
+	err = -EINVAL;
+	if (oh.len != nbytes)
+		goto err_finish;
+
+	/*
+	 * Zero oh.unique indicates unsolicited notification message
+	 * and error contains notification code.
+	 */
+	if (!oh.unique) {
+		err = fuse_notify(fc, oh.error, nbytes - sizeof(oh), cs);
+		return err ? err : nbytes;
+	}
+
+	err = -EINVAL;
+	if (oh.error <= -1000 || oh.error > 0)
+		goto err_finish;
+
+	//printk("out_header->unique_id = %lld\n"	, oh.unique);
+	//printk("out_header->bw_count = %lld\n", oh.bw_count);
+	
+	//printk("Response Ack::reqid %llu, Batch Count = %llu\n",oh.unique, oh.bw_count);
+	if(oh.bw_count > 1)
+		err = fuse_handle_batched_req(fud, cs, nbytes, oh);
+	else
+		err = fuse_handle_non_batched_req(fud, cs, nbytes, oh);
+	
+	//printk("num bg = %d, num active = %d\n", fc->num_background, fc->active_background);
+
+ err_finish:
+	fuse_copy_finish(cs);
+	return err;
+}
+
 
 /*
  * Write a single reply to a request.  First the header is copied from
@@ -1999,8 +2503,8 @@ static ssize_t fuse_dev_write(struct kiocb *iocb, struct iov_iter *from)
 		return -EINVAL;
 
 	fuse_copy_init(&cs, 0, from);
-
-	return fuse_dev_do_write(fud, &cs, iov_iter_count(from));
+	//printk("iov->length = %ld\n",iov_iter_count(from));
+	return fuse_dev_do_modified_write(fud, &cs, iov_iter_count(from));
 }
 
 static ssize_t fuse_dev_splice_write(struct pipe_inode_info *pipe,
