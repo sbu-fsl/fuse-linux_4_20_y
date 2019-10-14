@@ -22,6 +22,7 @@
 #include <linux/exportfs.h>
 #include <linux/posix_acl.h>
 #include <linux/pid_namespace.h>
+#include <linux/mm.h>
 
 MODULE_AUTHOR("Miklos Szeredi <miklos@szeredi.hu>");
 MODULE_DESCRIPTION("Filesystem in Userspace");
@@ -958,7 +959,13 @@ static void process_init_reply(struct fuse_conn *fc, struct fuse_req *req)
 static void fuse_send_init(struct fuse_conn *fc, struct fuse_req *req)
 {
 	struct fuse_init_in *arg = &req->misc.init_in;
-
+	unsigned long vaddr;
+	unsigned long pfn;
+	struct vm_area_struct *vma;
+	void *buff_addr;
+	int size = 0;
+	int ret;
+	
 	arg->major = FUSE_KERNEL_VERSION;
 	arg->minor = FUSE_KERNEL_MINOR_VERSION;
 	arg->max_readahead = fc->sb->s_bdi->ra_pages * PAGE_SIZE;
@@ -970,6 +977,36 @@ static void fuse_send_init(struct fuse_conn *fc, struct fuse_req *req)
 		FUSE_WRITEBACK_CACHE | FUSE_NO_OPEN_SUPPORT |
 		FUSE_PARALLEL_DIROPS | FUSE_HANDLE_KILLPRIV | FUSE_POSIX_ACL |
 		FUSE_ABORT_ERROR | FUSE_MAX_PAGES | FUSE_CACHE_SYMLINKS;
+	
+	
+	buff_addr = kmalloc(PAGE_SIZE, GFP_KERNEL);
+	printk("Is Buffer Aligned: %d\n", PAGE_ALIGNED(buff_addr));
+	
+	strcpy(buff_addr, "Hello There!! I am back with some good news...");
+	printk(KERN_DEBUG "Copied string: %s\n", (char *) buff_addr);
+	
+	pfn = virt_to_phys(buff_addr) >> PAGE_SHIFT;
+	printk("Buffer Addr: %lx\t pfn Number: %ld\n", (unsigned long)buff_addr, pfn);
+	
+	// Create new VM area for fuse daemon of size=PAGE_SIZE to 
+	// which we will later map the kernel page 
+	vaddr = vm_mmap(NULL, 0, PAGE_SIZE, 0x1, 0x1|0x20, 0);
+	vma = find_vma(current->mm, vaddr);
+	
+	// There is an error scenario where newly  created VM area is merged with existing area
+	// therefore causing the size to increase more than allocated size thus, results in remapping failures.
+	size = vma->vm_end - vma->vm_start;
+	printk(KERN_DEBUG "Size of VM area: %d\n", size);
+
+	ret = remap_pfn_range(vma, vma->vm_start, pfn, PAGE_SIZE, vma->vm_page_prot);
+	if (ret < 0){
+		printk(KERN_DEBUG "Error Code: %d\n", ret);
+    	printk(KERN_DEBUG "Could not map buffer to user process\n");
+	}
+	
+	arg->dummy_addr = vaddr;
+	printk("arg->dummy_addr: %lx\n", arg->dummy_addr);
+	
 	req->in.h.opcode = FUSE_INIT;
 	req->in.numargs = 1;
 	req->in.args[0].size = sizeof(*arg);
