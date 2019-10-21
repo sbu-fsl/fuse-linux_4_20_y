@@ -23,6 +23,7 @@
 #include <linux/posix_acl.h>
 #include <linux/pid_namespace.h>
 #include <linux/mm.h>
+#include <uapi/asm-generic/mman-common.h>
 
 MODULE_AUTHOR("Miklos Szeredi <miklos@szeredi.hu>");
 MODULE_DESCRIPTION("Filesystem in Userspace");
@@ -959,12 +960,13 @@ static void process_init_reply(struct fuse_conn *fc, struct fuse_req *req)
 static void fuse_send_init(struct fuse_conn *fc, struct fuse_req *req)
 {
 	struct fuse_init_in *arg = &req->misc.init_in;
-	unsigned long vaddr;
+	unsigned long vaddr, populate;
 	unsigned long pfn;
 	struct vm_area_struct *vma;
 	void *buff_addr;
 	int size = 0;
 	int ret;
+	struct list_head uf;
 	
 	arg->major = FUSE_KERNEL_VERSION;
 	arg->minor = FUSE_KERNEL_MINOR_VERSION;
@@ -980,28 +982,39 @@ static void fuse_send_init(struct fuse_conn *fc, struct fuse_req *req)
 	
 	
 	buff_addr = kmalloc(PAGE_SIZE, GFP_KERNEL);
-	printk("Is Buffer Aligned: %d\n", PAGE_ALIGNED(buff_addr));
+	printk(KERN_DEBUG "Is buffer returned by kmalloc page aligned?: %d\n", PAGE_ALIGNED(buff_addr));
 	
 	strcpy(buff_addr, "Hello There!! I am back with some good news...");
 	printk(KERN_DEBUG "Copied string: %s\n", (char *) buff_addr);
 	
 	pfn = virt_to_phys(buff_addr) >> PAGE_SHIFT;
-	printk("Buffer Addr: %lx\t pfn Number: %ld\n", (unsigned long)buff_addr, pfn);
+	printk(KERN_DEBUG "Buffer Address: %lx\t PFN: %ld\n", (unsigned long) buff_addr, pfn);
+		
+	/*
+ 	 * vm_mmap(NULL, 0, PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE, 0);
+ 	 * This does succesfully create a new mapping.
+ 	 * If there are adjacent existing memory mappings, VMA will be merged.
+ 	 * That's why we can we do_mmap with VM_SPECIAL flags.
+ 	 */
 	
-	// Create new VM area for fuse daemon of size=PAGE_SIZE to 
-	// which we will later map the kernel page 
-	vaddr = vm_mmap(NULL, 0, PAGE_SIZE, 0x1, 0x1|0x20, 0);
+	/* 
+ 	 * Create new VM area for fuse daemon of size = PAGE_SIZE.
+     * This VM area is used later to map the kernel page. 
+ 	 */
+
+	down_write(&current->mm->mmap_sem);
+	vaddr = do_mmap(NULL, 0, PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE, VM_SPECIAL, 0, &populate, &uf);
+	up_write(&current->mm->mmap_sem);
+
 	vma = find_vma(current->mm, vaddr);
 	
-	// There is an error scenario where newly  created VM area is merged with existing area
-	// therefore causing the size to increase more than allocated size thus, results in remapping failures.
 	size = vma->vm_end - vma->vm_start;
 	printk(KERN_DEBUG "Size of VM area: %d\n", size);
-
+	
 	ret = remap_pfn_range(vma, vma->vm_start, pfn, PAGE_SIZE, vma->vm_page_prot);
 	if (ret < 0){
 		printk(KERN_DEBUG "Error Code: %d\n", ret);
-    	printk(KERN_DEBUG "Could not map buffer to user process\n");
+    	printk(KERN_DEBUG "Remap Failed: Could not map buffer to user process\n");
 	}
 	
 	arg->dummy_addr = vaddr;

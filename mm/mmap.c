@@ -1563,6 +1563,7 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
 		*populate = len;
 	return addr;
 }
+EXPORT_SYMBOL(do_mmap);
 
 unsigned long ksys_mmap_pgoff(unsigned long addr, unsigned long len,
 			      unsigned long prot, unsigned long flags,
