@@ -1114,7 +1114,6 @@ static int forget_pending(struct fuse_iqueue *fiq)
 }
 
 static int request_pending(struct fuse_iqueue *fiq)
-
 {
 /*
 	// Code changes to print the queue states every time daemon comes to pick request 
