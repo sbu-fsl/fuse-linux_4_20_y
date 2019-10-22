@@ -1114,7 +1114,24 @@ static int forget_pending(struct fuse_iqueue *fiq)
 }
 
 static int request_pending(struct fuse_iqueue *fiq)
+
 {
+/*
+	// Code changes to print the queue states every time daemon comes to pick request 
+	int pending_empty = list_empty(&fiq->pending);
+	int interrupt_empty = list_empty(&fiq->interrupts);
+	int forget = forget_pending(fiq);
+	int ret = !pending_empty || !interrupt_empty || forget;
+	
+	if (!pending_empty)
+		printk(KERN_DEBUG "Pending Queue not Empty\n");
+	if(!interrupt_empty)
+		printk(KERN_DEBUG "Interrupt Queue not Empty\n");
+	if(forget)
+		printk(KERN_DEBUG "Forget Pending\n");
+
+	return ret;
+*/ 
 	return !list_empty(&fiq->pending) || !list_empty(&fiq->interrupts) ||
 		forget_pending(fiq);
 }
@@ -1291,7 +1308,6 @@ static ssize_t copy_write_reqs_to_buffer (struct fuse_dev *fud, struct file *fil
 	INIT_LIST_HEAD(&temp_queue);	
 
 	list_for_each_entry_safe(write_req, tmp_req, &fiq->pending, list) {
-		BUG_ON(count > 32);
 		// Should always be true as it was checked before
 		if(write_req->in.h.opcode == 16) {
 			write_req_counter = write_req_counter + 1;
