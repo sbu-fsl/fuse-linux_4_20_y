@@ -964,8 +964,8 @@ static void fuse_send_init(struct fuse_conn *fc, struct fuse_req *req)
 	unsigned long pfn;
 	struct vm_area_struct *vma;
 	void *buff_addr;
-	int size = 0;
-	int ret;
+	int ret, size;
+	struct mm_struct *mm = current->mm;
 	struct list_head uf;
 	
 	arg->major = FUSE_KERNEL_VERSION;
@@ -982,14 +982,24 @@ static void fuse_send_init(struct fuse_conn *fc, struct fuse_req *req)
 	
 	
 	buff_addr = kmalloc(PAGE_SIZE, GFP_KERNEL);
-	printk(KERN_DEBUG "Is buffer returned by kmalloc page aligned?: %d\n", PAGE_ALIGNED(buff_addr));
+	if (!buff_addr)
+		printk(KERN_ERR "Buffer allocation failed\n");
+
+	ret = PAGE_ALIGNED(buff_addr);
+	if (!ret) 
+		printk(KERN_WARNING "Buffer is not 4K aligned\n");
 	
 	strcpy(buff_addr, "Hello There!! I am back with some good news...");
-	printk(KERN_DEBUG "Copied string: %s\n", (char *) buff_addr);
 	
 	pfn = virt_to_phys(buff_addr) >> PAGE_SHIFT;
-	printk(KERN_DEBUG "Buffer Address: %lx\t PFN: %ld\n", (unsigned long) buff_addr, pfn);
-		
+	
+	/* Addresses are hashed before printing to prevent kernel info leak.
+ 	 * If you really want to see the address, use %px. %p will hash an address.
+ 	 */
+
+	printk(KERN_INFO "Buffer Address: %px\n", (void *) buff_addr);
+	printk(KERN_INFO "PFN: %ld\n", pfn);
+
 	/*
  	 * vm_mmap(NULL, 0, PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE, 0);
  	 * This does succesfully create a new mapping.
@@ -1002,23 +1012,26 @@ static void fuse_send_init(struct fuse_conn *fc, struct fuse_req *req)
      * This VM area is used later to map the kernel page. 
  	 */
 
-	down_write(&current->mm->mmap_sem);
-	vaddr = do_mmap(NULL, 0, PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE, VM_SPECIAL, 0, &populate, &uf);
-	up_write(&current->mm->mmap_sem);
+	down_write(&mm->mmap_sem);
+	vaddr = do_mmap(NULL, 0, PAGE_SIZE, PROT_READ,
+					MAP_SHARED | MAP_ANONYMOUS, VM_DONTEXPAND, 0, &populate, &uf);
+	if (vaddr < 0)
+		printk(KERN_ERR "Unable to get a virtual address. Failed: %ld\n", vaddr);
+	up_write(&mm->mmap_sem);
 
-	vma = find_vma(current->mm, vaddr);
-	
+	vma = find_vma(mm, vaddr);
+	if (!vma)
+		printk(KERN_ERR "Unable to find struct VMA for the address: %ld\n", vaddr);
+
 	size = vma->vm_end - vma->vm_start;
-	printk(KERN_DEBUG "Size of VM area: %d\n", size);
+	printk(KERN_INFO "Size of VM area: %d\n", size);
 	
 	ret = remap_pfn_range(vma, vma->vm_start, pfn, PAGE_SIZE, vma->vm_page_prot);
-	if (ret < 0){
-		printk(KERN_DEBUG "Error Code: %d\n", ret);
-    	printk(KERN_DEBUG "Remap Failed: Could not map buffer to user process\n");
-	}
+	if (ret < 0)
+    	printk(KERN_ERR "Remap Failed with error code: %d\n", ret);
 	
 	arg->dummy_addr = vaddr;
-	printk("arg->dummy_addr: %lx\n", arg->dummy_addr);
+	printk(KERN_INFO "arg->dummy_addr: %px\n", (void *) arg->dummy_addr);
 	
 	req->in.h.opcode = FUSE_INIT;
 	req->in.numargs = 1;
