@@ -994,7 +994,8 @@ static void fuse_send_init(struct fuse_conn *fc, struct fuse_req *req)
 	pfn = virt_to_phys(buff_addr) >> PAGE_SHIFT;
 
 	down_write(&mm->mmap_sem);
-	vaddr = do_mmap(NULL, 0, PAGE_SIZE, PROT_READ, MAP_SHARED | MAP_ANONYMOUS, VM_SPECIAL, 0, &populate, &uf);
+	vaddr = do_mmap(NULL, 0, PAGE_SIZE, PROT_READ,
+					MAP_SHARED | MAP_ANONYMOUS, VM_DONTEXPAND, 0, &populate, &uf);
 	if (vaddr < 0)
 		printk(KERN_ERR "Unable to get a virtual address. Failed: %ld\n", vaddr);
 	up_write(&mm->mmap_sem);
