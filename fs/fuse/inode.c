@@ -982,19 +982,28 @@ static void fuse_send_init(struct fuse_conn *fc, struct fuse_req *req)
 	
 	
 	buff_addr = kmalloc(PAGE_SIZE, GFP_KERNEL);
-	printk(KERN_DEBUG "Is buffer returned by kmalloc page aligned?: %d\n", PAGE_ALIGNED(buff_addr));
+	if (!buff_addr)
+		printk(KERN_ERR "Buffer allocation failed\n");
 	
+	ret = PAGE_ALIGNED(buff_addr);
+	if (!ret) 
+		printk(KERN_WARNING "Buffer is not 4K aligned\n");
+		
 	strcpy(buff_addr, "Hello There!! I am back with some good news...");
 	
 	pfn = virt_to_phys(buff_addr) >> PAGE_SHIFT;
 
 	down_write(&mm->mmap_sem);
 	vaddr = do_mmap(NULL, 0, PAGE_SIZE, PROT_READ, MAP_SHARED | MAP_ANONYMOUS, VM_SPECIAL, 0, &populate, &uf);
+	if (vaddr < 0)
+		printk(KERN_ERR "Unable to get a virtual address. Failed: %ld\n", vaddr);
 	up_write(&mm->mmap_sem);
 
 	vma = find_vma(mm, vaddr);	
-	ret = remap_pfn_range(vma, vma->vm_start, pfn, PAGE_SIZE, vma->vm_page_prot);
+	if (!vma)
+		printk(KERN_ERR "Unable to find struct VMA for the address: %ld\n", vaddr);
 	
+	ret = remap_pfn_range(vma, vma->vm_start, pfn, PAGE_SIZE, vma->vm_page_prot);
 	if (ret < 0)
     	printk(KERN_DEBUG "Remap Failed with %d\n", ret);
 
