@@ -1006,7 +1006,7 @@ static void fuse_send_init(struct fuse_conn *fc, struct fuse_req *req)
 	
 	ret = remap_pfn_range(vma, vma->vm_start, pfn, PAGE_SIZE, vma->vm_page_prot);
 	if (ret < 0)
-    	printk(KERN_DEBUG "Remap Failed with %d\n", ret);
+    	printk(KERN_ERR "Remap Failed with %d\n", ret);
 
 	arg->dummy_addr = vaddr;
 	
